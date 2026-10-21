@@ -1,0 +1,22 @@
+{
+  "name": "guessnum",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "数字炸弹：支持重复数字与前导零的单机、双人联机猜数游戏",
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node --watch server.mjs",
+    "test": "node --test tests/game.test.mjs tests/server.test.mjs",
+    "test:browser": "playwright test"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@playwright/test": "^1.56.0"
+  }
+}

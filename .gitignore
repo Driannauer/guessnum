@@ -1,0 +1,33 @@
+# Dependencies
+/node_modules/
+
+# Runtime data and backups
+/data/
+/backups/
+*.sqlite
+*.sqlite-*
+*.sqlite3
+*.sqlite3-*
+*.db
+*.db-*
+*.bak
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+*.p12
+*.pfx
+
+# Generated reports and temporary files
+/test-results/
+/playwright-report/
+/coverage/
+*.log
+*.tmp
+*.swp
+*~
+.DS_Store
+Thumbs.db
