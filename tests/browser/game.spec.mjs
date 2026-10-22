@@ -21,7 +21,7 @@ async function assertSingleScreen(page) {
     const keypad = document.querySelector(".keypad")?.getBoundingClientRect();
     const visible = [
       ...document.querySelectorAll(
-        ".digit-entry, .keypad, .number-dial, .record-sheets, .history-table tbody tr",
+        ".digit-entry, .keypad, .number-dial, .record-sheets, .history-table tbody tr, .input-heading, .game-clock, .outcome-banner, .outcome-copy h2, .result-code, .result-action",
       ),
     ].every((element) => {
       const rect = element.getBoundingClientRect();
@@ -86,7 +86,11 @@ test("单机：右侧三列记录、刷新恢复、揭晓和重新开始", async
   await assertSingleScreen(page);
   await page.reload();
   await expect(page.locator(".guess-number")).toHaveText("0012");
-  if (await page.getByText("猜中了", { exact: true }).isVisible())
+  if (
+    await page
+      .getByRole("heading", { name: "挑战成功！", exact: true })
+      .isVisible()
+  )
     await page.getByRole("button", { name: "再来一局" }).click();
   await page.getByRole("button", { name: "设置", exact: true }).click();
   await page.getByRole("button", { name: "揭晓答案" }).click();
@@ -428,8 +432,12 @@ test("两个浏览器完整对弈：房间、数字锁定、实时记录、再�
     await group(a, "猜测对手的四位数字").locator("input").nth(1).click();
     await a.keyboard.type("122");
     await a.getByRole("button", { name: "猜一下", exact: true }).click();
-    await expect(a.getByText("你赢了", { exact: true })).toBeVisible();
-    await expect(b.getByText("对手获胜", { exact: true })).toBeVisible();
+    await expect(
+      a.getByRole("heading", { name: "挑战成功！", exact: true }),
+    ).toBeVisible();
+    await expect(
+      b.getByRole("heading", { name: "挑战失败", exact: true }),
+    ).toBeVisible();
     await assertSingleScreen(a);
     await a.getByRole("button", { name: "再来一局", exact: true }).click();
     await b.getByRole("button", { name: "接受再战", exact: true }).click();
@@ -473,7 +481,8 @@ test("电脑端窄窗口正常铺满，不受横屏限制；设置集中模式�
   ).toBeVisible();
   await expect(page.getByRole("dialog")).toContainText("数字对");
   await expect(page.getByRole("dialog")).toContainText("位置对");
-  await expect(page.locator(".rules-content li")).toHaveCount(3);
+  await expect(page.locator(".rules-content")).toContainText("每人累计 5 分钟");
+  await expect(page.locator(".rules-content")).toContainText("第一次点击");
   await expect(page.locator(".rules-content")).not.toContainText("固定");
   await expect(page.locator(".rules-content")).not.toContainText("Enter");
   await expect(page.locator(".rules-content")).not.toContainText("排除");
@@ -1008,7 +1017,9 @@ test("两联各 8 行从底部追加，第 9 次进入右联，第 16 次失败�
   }
   await enterCode(page, "5678");
   await page.getByRole("button", { name: "猜一下", exact: true }).click();
-  await expect(page.getByText("挑战失败", { exact: true })).toBeVisible();
+  await expect(
+    page.getByRole("heading", { name: "次数用尽", exact: true }),
+  ).toBeVisible();
   await expect(page.locator(".result-code")).toHaveText("9999");
   await expect(page.locator("tr[data-guess]")).toHaveCount(16);
   await expect(page.locator(".guess-number").last()).toHaveText("5678");
@@ -1057,7 +1068,9 @@ test("手机小屏能完整显示两联 16 行记录", async ({ browser }) => {
     );
     await page.routeWebSocket("**/ws", () => {});
     await page.goto("/");
-    await expect(page.getByText("挑战失败", { exact: true })).toBeVisible();
+    await expect(
+      page.getByRole("heading", { name: "次数用尽", exact: true }),
+    ).toBeVisible();
     await expect(page.locator("tbody tr")).toHaveCount(16);
     await expect(page.locator(".guess-number")).toHaveCount(16);
     for (const viewport of [
@@ -1110,12 +1123,16 @@ test("联机 16 次后双方显示流局，记录保留并可再战", async ({ b
       await post(aContext, "/api/rooms/guess", { guess: String(9000 + i) });
       if (i === 15) {
         await expect(b.getByText("你的回合", { exact: true })).toBeVisible();
-        await expect(b.getByText("流局", { exact: true })).not.toBeVisible();
+        await expect(
+          b.getByRole("heading", { name: "本局流局", exact: true }),
+        ).not.toBeVisible();
       }
       await post(bContext, "/api/rooms/guess", { guess: String(8000 + i) });
     }
     for (const player of [a, b]) {
-      await expect(player.getByText("流局", { exact: true })).toBeVisible();
+      await expect(
+        player.getByRole("heading", { name: "本局流局", exact: true }),
+      ).toBeVisible();
       await expect(player.locator(".guess-number")).toHaveCount(16);
       await expect(
         player.locator(".history-table").nth(1).locator(".guess-number"),
@@ -1134,3 +1151,374 @@ test("联机 16 次后双方显示流局，记录保留并可再战", async ({ b
     await bContext.close();
   }
 });
+
+test("单机首猜启动倒计时，重复猜测简短提示，低时变色且自动同步超时和新局", async ({
+  page,
+}) => {
+  const now = Date.UTC(2026, 9, 22, 0, 0, 0);
+  await page.clock.install({ time: new Date(now) });
+  let fixture = {
+    version: 1,
+    serverNow: now,
+    timeLimitMs: 300_000,
+    solo: {
+      status: "playing",
+      startedAt: now,
+      guesses: [],
+      clock: { elapsedMs: 0, runningSince: null },
+    },
+    room: null,
+  };
+  let submissions = 0;
+  await page.route("**/api/state", (route) => route.fulfill({ json: fixture }));
+  await page.route("**/api/solo/guess", (route) => {
+    submissions++;
+    fixture = {
+      ...fixture,
+      version: fixture.version + 1,
+      serverNow: now + 30_000,
+      solo: {
+        ...fixture.solo,
+        guesses: [{ guess: "1234", digits: 3, positions: 1 }],
+        clock: { elapsedMs: 0, runningSince: now + 30_000 },
+      },
+    };
+    return route.fulfill({ json: fixture });
+  });
+  await page.route("**/api/solo/start", (route) => {
+    fixture = {
+      ...fixture,
+      version: fixture.version + 1,
+      solo: {
+        status: "playing",
+        startedAt: now + 400_000,
+        guesses: [],
+        clock: { elapsedMs: 0, runningSince: null },
+      },
+    };
+    return route.fulfill({ json: fixture });
+  });
+  await page.goto("/");
+  const clock = page.getByRole("timer", { name: "单机剩余时间" });
+  await expect(clock).toContainText("首猜起计时");
+  await page.clock.fastForward(30_000);
+  await expect(clock.locator("b")).toHaveText("05:00");
+  await expect(clock).toHaveAttribute("data-running", "false");
+  await enterCode(page, "1234");
+  await page.getByRole("button", { name: "猜一下", exact: true }).click();
+  await expect(clock).toHaveAttribute("data-running", "true");
+  await page.clock.setSystemTime(new Date("2050-01-01T00:00:00Z"));
+  await page.clock.runFor(2100);
+  await expect(clock.locator("b")).toHaveText("04:58");
+  await enterCode(page, "1234");
+  await page.getByRole("button", { name: "猜一下", exact: true }).click();
+  await expect(page.locator("#toast")).toHaveText("这个数字已经猜过了");
+  expect(submissions).toBe(1);
+  expect(await values(page)).toEqual(["1", "2", "3", "4"]);
+  await enterCode(page, "5678");
+  const focused = await page.locator(":focus").getAttribute("id");
+  await page.clock.fastForward(238_000);
+  await expect(clock).toHaveAttribute("data-low", "true");
+  await expect(page.locator("#toast")).not.toBeVisible();
+  expect(await values(page)).toEqual(["5", "6", "7", "8"]);
+  await expect(page.locator(":focus")).toHaveAttribute("id", focused);
+  await page.clock.runFor(4000);
+  await expect(page.locator("#toast")).not.toBeVisible();
+  fixture = {
+    ...fixture,
+    version: fixture.version + 1,
+    serverNow: now + 330_000,
+    solo: {
+      ...fixture.solo,
+      status: "lost",
+      reason: "timeout",
+      answer: "0012",
+      clock: { elapsedMs: 300_000, runningSince: null },
+    },
+  };
+  await page.clock.fastForward(60_000);
+  await expect(
+    page.getByRole("heading", { name: "时间超时", exact: true }),
+  ).toBeVisible();
+  await expect(clock.locator("b")).toHaveText("00:00");
+  await expect(page.locator(".result-code")).toHaveText("0012");
+  await expect(page.locator(".guess-number")).toHaveText("1234");
+  await page.reload();
+  await expect(
+    page.getByRole("heading", { name: "时间超时", exact: true }),
+  ).toBeVisible();
+  await page.getByRole("button", { name: "再来一局", exact: true }).click();
+  await expect(clock.locator("b")).toHaveText("05:00");
+  await expect(clock).toHaveAttribute("data-running", "false");
+  await expect(page.locator(".guess-number")).toHaveCount(0);
+});
+
+test("联机双方倒计时只随本方回合运行，超时结果同步后再战重置", async ({
+  page,
+}) => {
+  const now = Date.UTC(2026, 9, 22, 0, 0, 0);
+  await page.clock.install({ time: new Date(now) });
+  await page.addInitScript(() => localStorage.setItem("guessnum_mode", "duel"));
+  let fixture = {
+    version: 1,
+    serverNow: now,
+    timeLimitMs: 300_000,
+    solo: { status: "playing", startedAt: now, guesses: [] },
+    room: {
+      code: "123456",
+      phase: "playing",
+      match: 1,
+      turn: "you",
+      winner: null,
+      you: {
+        name: "玩家一",
+        ready: true,
+        secret: "0012",
+        guesses: [],
+        rematch: false,
+        clock: { elapsedMs: 40_000, runningSince: now },
+      },
+      opponent: {
+        name: "玩家二",
+        ready: true,
+        online: true,
+        guesses: [],
+        rematch: false,
+        clock: { elapsedMs: 15_000, runningSince: null },
+      },
+    },
+  };
+  await page.route("**/api/state", (route) => route.fulfill({ json: fixture }));
+  let socket;
+  await page.routeWebSocket("**/ws", (current) => {
+    socket = current;
+  });
+  await page.route("**/api/rooms/rematch", (route) => {
+    fixture = {
+      ...fixture,
+      version: fixture.version + 1,
+      room: {
+        ...fixture.room,
+        phase: "setup",
+        match: 2,
+        reason: null,
+        winner: null,
+        turn: null,
+        you: {
+          ...fixture.room.you,
+          ready: false,
+          secret: null,
+          clock: { elapsedMs: 0, runningSince: null },
+        },
+        opponent: {
+          ...fixture.room.opponent,
+          ready: false,
+          secret: null,
+          clock: { elapsedMs: 0, runningSince: null },
+        },
+      },
+    };
+    return route.fulfill({ json: fixture });
+  });
+  await page.goto("/");
+  const you = page.getByRole("timer", { name: "我的剩余时间" });
+  const opponent = page.getByRole("timer", { name: "对手剩余时间" });
+  await expect(you).toHaveAttribute("data-running", "true");
+  await expect(opponent).toHaveAttribute("data-running", "false");
+  await expect.poll(() => Boolean(socket)).toBe(true);
+  await page.clock.runFor(2200);
+  await expect(you.locator("b")).toHaveText("04:18");
+  await expect(opponent.locator("b")).toHaveText("04:45");
+  fixture = {
+    ...fixture,
+    version: fixture.version + 1,
+    serverNow: now + 2200,
+    room: {
+      ...fixture.room,
+      turn: "opponent",
+      you: {
+        ...fixture.room.you,
+        clock: { elapsedMs: 42_200, runningSince: null },
+      },
+      opponent: {
+        ...fixture.room.opponent,
+        clock: { elapsedMs: 15_000, runningSince: now + 2200 },
+      },
+    },
+  };
+  socket.send(JSON.stringify({ type: "state", ...fixture }));
+  await expect(you).toHaveAttribute("data-running", "false");
+  await expect(opponent).toHaveAttribute("data-running", "true");
+  await page.clock.runFor(5000);
+  await expect(you.locator("b")).toHaveText("04:18");
+  await expect(opponent.locator("b")).toHaveText("04:40");
+  fixture = {
+    ...fixture,
+    version: fixture.version + 1,
+    serverNow: now + 300_000,
+    room: {
+      ...fixture.room,
+      phase: "finished",
+      reason: "timeout",
+      winner: "you",
+      turn: null,
+      opponent: {
+        ...fixture.room.opponent,
+        secret: "1122",
+        clock: { elapsedMs: 300_000, runningSince: null },
+      },
+    },
+  };
+  socket.send(JSON.stringify({ type: "state", ...fixture }));
+  await expect(
+    page.getByRole("heading", { name: "对手超时！", exact: true }),
+  ).toBeVisible();
+  await expect(opponent.locator("b")).toHaveText("00:00");
+  await expect(page.locator(".result-code")).toHaveText("1122");
+  await page.getByRole("button", { name: "再来一局", exact: true }).click();
+  await expect(group(page, "设置你的四位秘密数字")).toBeVisible();
+  for (const clock of [you, opponent]) {
+    await expect(clock.locator("b")).toHaveText("05:00");
+    await expect(clock).toHaveAttribute("data-running", "false");
+  }
+});
+
+for (const mobile of [false, true]) {
+  test(`${mobile ? "手机竖屏" : "电脑端"}成功、次数用尽、超时和揭晓结果清晰放大且不溢出`, async ({
+    browser,
+  }) => {
+    const context = await browser.newContext(
+      mobile ? { ...devices["iPhone SE"], deviceScaleFactor: 1 } : {},
+    );
+    const page = await context.newPage();
+    const cases = [
+      {
+        status: "won",
+        reason: "guessed",
+        title: "挑战成功！",
+        elapsedMs: 48_000,
+      },
+      { status: "lost", reason: "limit", title: "次数用尽", elapsedMs: 90_000 },
+      {
+        status: "lost",
+        reason: "timeout",
+        title: "时间超时",
+        elapsedMs: 300_000,
+      },
+      {
+        status: "revealed",
+        reason: "revealed",
+        title: "答案揭晓",
+        elapsedMs: 25_000,
+      },
+      {
+        duel: true,
+        reason: "guessed",
+        winner: "you",
+        title: "挑战成功！",
+        elapsedMs: 48_000,
+      },
+      {
+        duel: true,
+        reason: "timeout",
+        winner: "opponent",
+        title: "时间超时",
+        elapsedMs: 300_000,
+      },
+      {
+        duel: true,
+        reason: "limit",
+        winner: null,
+        title: "本局流局",
+        elapsedMs: 90_000,
+      },
+    ];
+    let fixture;
+    await page.route("**/api/state", (route) =>
+      route.fulfill({ json: fixture }),
+    );
+    await page.routeWebSocket("**/ws", () => {});
+    try {
+      for (const [index, item] of cases.entries()) {
+        const guesses = Array.from(
+          { length: item.reason === "limit" ? 16 : 3 },
+          (_, i) => ({ guess: String(9000 + i), digits: 1, positions: 0 }),
+        );
+        const clock = { elapsedMs: item.elapsedMs, runningSince: null };
+        fixture = {
+          version: index + 1,
+          solo: {
+            status: item.status || "playing",
+            reason: item.reason,
+            startedAt: index + 1,
+            answer: "0012",
+            guesses,
+            clock,
+          },
+          room: item.duel
+            ? {
+                code: "123456",
+                phase: "finished",
+                match: 1,
+                turn: null,
+                winner: item.winner,
+                reason: item.reason,
+                you: {
+                  name: "玩家一",
+                  ready: true,
+                  secret: "0012",
+                  guesses,
+                  rematch: false,
+                  clock,
+                },
+                opponent: {
+                  name: "玩家二",
+                  ready: true,
+                  secret: "1122",
+                  online: true,
+                  guesses,
+                  rematch: false,
+                  clock: { elapsedMs: 45_000, runningSince: null },
+                },
+              }
+            : null,
+        };
+        for (const viewport of mobile
+          ? [
+              { width: 320, height: 568 },
+              { width: 375, height: 812 },
+              { width: 768, height: 1024 },
+            ]
+          : [
+              { width: 568, height: 320 },
+              { width: 640, height: 960 },
+              { width: 1440, height: 900 },
+            ]) {
+          await page.setViewportSize(viewport);
+          await page.goto(item.duel ? "/?room=123456" : "/");
+          const heading = page.getByRole("heading", {
+            name: item.title,
+            exact: true,
+          });
+          await expect(heading).toBeVisible();
+          expect(
+            await heading.evaluate((element) =>
+              parseFloat(getComputedStyle(element).fontSize),
+            ),
+          ).toBeGreaterThanOrEqual(22);
+          await assertSingleScreen(page);
+          await expect(page.locator("tbody tr")).toHaveCount(16);
+          await expect(
+            page.getByRole("button", { name: "再来一局", exact: true }),
+          ).toBeVisible();
+          if (viewport.width === (mobile ? 375 : 1440))
+            await page.screenshot({
+              path: `test-results/${mobile ? "mobile" : "desktop"}-${item.duel ? "duel-" : ""}${item.reason}.png`,
+            });
+        }
+      }
+    } finally {
+      await context.close();
+    }
+  });
+}

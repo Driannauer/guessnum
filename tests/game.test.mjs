@@ -6,6 +6,13 @@ import {
   randomCode,
   publicSolo,
   publicRoom,
+  makeClock,
+  makeSolo,
+  elapsedTime,
+  stopClock,
+  syncSoloClock,
+  syncRoomClocks,
+  TIME_LIMIT_MS,
 } from "../lib/game.mjs";
 
 test("四位数字保留前导零，允许重复，拒绝数字类型和不完整输入", () => {
@@ -104,4 +111,94 @@ test("公开状态不会暴露进行中答案或对手的身份令牌", () => {
   assert.equal(publicRoom(room, "uninvited"), null);
   room.phase = "finished";
   assert.equal(publicRoom(room, "alice-private-id").opponent.secret, "3456");
+});
+
+test("计时只累计运行区间，暂停后冻结，继续时保留已用时间", () => {
+  const clock = makeClock();
+  assert.equal(elapsedTime(clock, 100_000), 0);
+  clock.runningSince = 1000;
+  stopClock(clock, 31_000);
+  assert.deepEqual(clock, { elapsedMs: 30_000, runningSince: null });
+  assert.equal(elapsedTime(clock, 200_000), 30_000);
+  clock.runningSince = 200_000;
+  assert.equal(elapsedTime(clock, 210_000), 40_000);
+  stopClock(clock, 600_000);
+  assert.equal(clock.elapsedMs, TIME_LIMIT_MS);
+});
+
+test("单机首猜前不计时，5 分钟边界判负，结束后计时冻结", () => {
+  const solo = makeSolo();
+  syncSoloClock(solo, solo.startedAt + TIME_LIMIT_MS * 10);
+  assert.equal(solo.status, "playing");
+  assert.deepEqual(solo.clock, makeClock());
+  solo.clock.runningSince = 1000;
+  syncSoloClock(solo, 1000 + TIME_LIMIT_MS - 1);
+  assert.equal(solo.status, "playing");
+  syncSoloClock(solo, 1000 + TIME_LIMIT_MS);
+  assert.equal(solo.status, "lost");
+  assert.equal(solo.reason, "timeout");
+  assert.deepEqual(solo.clock, {
+    elapsedMs: TIME_LIMIT_MS,
+    runningSince: null,
+  });
+  assert.equal(publicSolo(solo).answer, solo.secret);
+  assert.equal(syncSoloClock(solo, 1000 + TIME_LIMIT_MS * 2), false);
+});
+
+test("联机累计本方回合时间，恰好耗尽预算时判负并冻结双方计时", () => {
+  const room = {
+    phase: "playing",
+    turn: "alice",
+    players: [
+      {
+        id: "alice",
+        guesses: [],
+        clock: { elapsedMs: 20_000, runningSince: 1000 },
+      },
+      {
+        id: "bob",
+        guesses: [],
+        clock: { elapsedMs: 8000, runningSince: null },
+      },
+    ],
+  };
+  const deadline = 1000 + TIME_LIMIT_MS - 20_000;
+  syncRoomClocks(room, deadline - 1);
+  assert.equal(room.phase, "playing");
+  syncRoomClocks(room, deadline);
+  assert.equal(room.phase, "finished");
+  assert.equal(room.reason, "timeout");
+  assert.equal(room.winner, "bob");
+  assert.equal(room.turn, null);
+  assert.deepEqual(
+    room.players.map((p) => p.clock),
+    [
+      { elapsedMs: TIME_LIMIT_MS, runningSince: null },
+      { elapsedMs: 8000, runningSince: null },
+    ],
+  );
+});
+
+test("更新前的旧游戏恢复时获得完整预算，不按创建时间追溯判负", () => {
+  const solo = {
+    status: "playing",
+    startedAt: 1,
+    guesses: [{ guess: "0000" }],
+  };
+  assert.equal(syncSoloClock(solo, 1_000_000), true);
+  assert.equal(solo.status, "playing");
+  assert.deepEqual(solo.clock, { elapsedMs: 0, runningSince: 1_000_000 });
+  const room = {
+    phase: "playing",
+    turn: "bob",
+    players: [
+      { id: "alice", guesses: [] },
+      { id: "bob", guesses: [] },
+    ],
+  };
+  assert.equal(syncRoomClocks(room, 1_000_000), true);
+  assert.deepEqual(
+    room.players.map((p) => p.clock),
+    [makeClock(), { elapsedMs: 0, runningSince: 1_000_000 }],
+  );
 });

@@ -8,11 +8,13 @@ import { join } from "node:path";
 import { createHash } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 import WebSocket from "ws";
+import { TIME_LIMIT_MS, makeClock } from "../lib/game.mjs";
 
 const dataDir = mkdtempSync(join(tmpdir(), "guessnum-test-"));
 let child;
 let base;
 let log = "";
+let clientNumber = 0;
 
 async function start() {
   child = spawn(process.execPath, ["server.mjs"], {
@@ -56,6 +58,7 @@ async function stop() {
   }
 }
 function client() {
+  const ip = `127.0.0.${++clientNumber}`;
   return {
     cookie: "",
     async request(path, body, headers = {}) {
@@ -63,6 +66,7 @@ function client() {
         method: body === undefined ? "GET" : "POST",
         headers: {
           Cookie: this.cookie,
+          "X-Real-IP": ip,
           ...(body === undefined ? {} : { "Content-Type": "application/json" }),
           ...headers,
         },
@@ -363,6 +367,7 @@ test("服务重启后，单机记录和双人房间持久保存", async () => {
   await alice.request("/api/rooms/secret", { secret: "0012" });
   await bob.request("/api/rooms/secret", { secret: "1122" });
   await alice.request("/api/rooms/guess", { guess: "1111" });
+  const beforeRestart = (await alice.request("/api/state")).data;
   await stop();
   await start();
   const restored = (await alice.request("/api/state")).data;
@@ -376,6 +381,12 @@ test("服务重启后，单机记录和双人房间持久保存", async () => {
   });
   assert.equal(restored.room.turn, "opponent");
   assert.equal("secret" in restored.room.opponent, false);
+  assert.deepEqual(restored.solo.clock, beforeRestart.solo.clock);
+  assert.deepEqual(restored.room.you.clock, beforeRestart.room.you.clock);
+  assert.deepEqual(
+    restored.room.opponent.clock,
+    beforeRestart.room.opponent.clock,
+  );
 });
 
 function soloSecret(person) {
@@ -549,4 +560,256 @@ test("更新前已有 16 次未中记录的游戏会正常结束", async () => {
   assert.equal(restored.room.phase, "finished");
   assert.equal(restored.room.reason, "limit");
   assert.equal(restored.room.winner, null);
+});
+
+function sessionId(person) {
+  return createHash("sha256").update(person.cookie.split("=")[1]).digest("hex");
+}
+
+function storedGame(table, key, mutate) {
+  const column = table === "sessions" ? "id" : "code";
+  const db = new DatabaseSync(join(dataDir, "guessnum.sqlite"));
+  try {
+    const value = JSON.parse(
+      db.prepare(`SELECT data FROM ${table} WHERE ${column} = ?`).get(key).data,
+    );
+    if (mutate) {
+      mutate(value);
+      db.prepare(`UPDATE ${table} SET data = ? WHERE ${column} = ?`).run(
+        JSON.stringify(value),
+        key,
+      );
+    }
+    return value;
+  } finally {
+    db.close();
+  }
+}
+
+test("单机首次有效猜测才开始，重复和非法输入不重置计时，揭晓后停止", async () => {
+  const alice = client();
+  const initial = (await alice.request("/api/solo/start", {})).data;
+  assert.equal(initial.timeLimitMs, TIME_LIMIT_MS);
+  assert.equal(typeof initial.serverNow, "number");
+  assert.deepEqual(initial.solo.clock, makeClock());
+  storedGame("sessions", sessionId(alice), (session) => {
+    session.solo.startedAt = Date.now() - 10 * TIME_LIMIT_MS;
+  });
+  await alice.request("/api/solo/guess", { guess: "123" });
+  assert.deepEqual(
+    (await alice.request("/api/state")).data.solo.clock,
+    makeClock(),
+  );
+  const secret = soloSecret(alice);
+  const misses = ["0000", "1111", "2222"].filter((guess) => guess !== secret);
+  const first = (
+    await alice.request("/api/solo/guess", {
+      guess: misses[0],
+      clock: { elapsedMs: 0, runningSince: null },
+    })
+  ).data.solo;
+  assert.ok(first.clock.runningSince >= initial.serverNow);
+  assert.equal(
+    (await alice.request("/api/solo/guess", { guess: misses[0] })).status,
+    400,
+  );
+  const second = (await alice.request("/api/solo/guess", { guess: misses[1] }))
+    .data.solo;
+  assert.equal(second.clock.runningSince, first.clock.runningSince);
+  const revealed = (await alice.request("/api/solo/reveal", {})).data.solo;
+  assert.equal(revealed.clock.runningSince, null);
+  assert.ok(revealed.clock.elapsedMs >= 0);
+  assert.deepEqual(
+    (await alice.request("/api/state")).data.solo.clock,
+    revealed.clock,
+  );
+  assert.deepEqual(
+    (await alice.request("/api/solo/start", {})).data.solo.clock,
+    makeClock(),
+  );
+});
+
+test("单机无人操作时服务器也会超时判负、推送答案并拒绝迟到猜测", async () => {
+  const alice = client();
+  await alice.request("/api/solo/start", {});
+  const secret = soloSecret(alice);
+  await alice.request("/api/solo/guess", {
+    guess: secret === "0000" ? "1111" : "0000",
+  });
+  const ws = await connect(alice);
+  try {
+    storedGame("sessions", sessionId(alice), (session) => {
+      session.solo.clock = {
+        elapsedMs: 2000,
+        runningSince: Date.now() - (TIME_LIMIT_MS - 2000) + 600,
+      };
+    });
+    await alice.request("/api/state");
+    await until(
+      () => ws.messages.some((message) => message.solo?.reason === "timeout"),
+      "Solo timeout was not pushed",
+    );
+    const expired = ws.messages.find(
+      (message) => message.solo?.reason === "timeout",
+    ).solo;
+    assert.equal(expired.status, "lost");
+    assert.equal(expired.answer, secret);
+    assert.deepEqual(expired.clock, {
+      elapsedMs: TIME_LIMIT_MS,
+      runningSince: null,
+    });
+    const late = await alice.request("/api/solo/guess", { guess: secret });
+    assert.equal(late.status, 409);
+    assert.match(late.data.error, /超时/);
+    assert.equal(
+      (await alice.request("/api/state")).data.solo.guesses.length,
+      1,
+    );
+  } finally {
+    ws.terminate();
+  }
+});
+
+test("联机等待和准备不计时，换手只暂停本方时间，恢复回合时累计而非重置", async () => {
+  const alice = client();
+  const bob = client();
+  const created = (await alice.request("/api/rooms/create", {})).data.room;
+  assert.deepEqual(created.you.clock, makeClock());
+  await alice.request("/api/rooms/secret", { secret: "0012" });
+  const joined = (await bob.request("/api/rooms/join", { code: created.code }))
+    .data.room;
+  assert.deepEqual(joined.you.clock, makeClock());
+  assert.deepEqual(joined.opponent.clock, makeClock());
+  const ready = (await bob.request("/api/rooms/secret", { secret: "1122" }))
+    .data.room;
+  assert.deepEqual(ready.you.clock, makeClock());
+  assert.equal(typeof ready.opponent.clock.runningSince, "number");
+  storedGame("rooms", created.code, (room) => {
+    room.players[0].clock = {
+      elapsedMs: 40_000,
+      runningSince: Date.now() - 1000,
+    };
+    room.players[1].clock = { elapsedMs: 15_000, runningSince: null };
+  });
+  const aGuess = (await alice.request("/api/rooms/guess", { guess: "9999" }))
+    .data.room;
+  assert.equal(aGuess.you.clock.runningSince, null);
+  assert.ok(aGuess.you.clock.elapsedMs >= 41_000);
+  assert.equal(aGuess.opponent.clock.elapsedMs, 15_000);
+  assert.equal(typeof aGuess.opponent.clock.runningSince, "number");
+  const waiting = (await alice.request("/api/state")).data.room;
+  assert.deepEqual(waiting.you.clock, aGuess.you.clock);
+  const bGuess = (await bob.request("/api/rooms/guess", { guess: "8888" })).data
+    .room;
+  assert.equal(bGuess.you.clock.runningSince, null);
+  assert.ok(bGuess.you.clock.elapsedMs >= 15_000);
+  assert.equal(bGuess.opponent.clock.elapsedMs, aGuess.you.clock.elapsedMs);
+  assert.equal(typeof bGuess.opponent.clock.runningSince, "number");
+  const won = (await alice.request("/api/rooms/guess", { guess: "1122" })).data
+    .room;
+  assert.equal(won.winner, "you");
+  assert.equal(won.you.clock.runningSince, null);
+  assert.equal(won.opponent.clock.runningSince, null);
+  assert.deepEqual(
+    (await alice.request("/api/state")).data.room.you.clock,
+    won.you.clock,
+  );
+});
+
+test("联机任一方累计超时会主动通知双方，保留记录并可重置计时再战", async () => {
+  for (const loser of ["alice", "bob"]) {
+    const { alice, bob, code } = await duel();
+    if (loser === "bob")
+      await alice.request("/api/rooms/guess", { guess: "9999" });
+    const aWs = await connect(alice);
+    const bWs = await connect(bob);
+    try {
+      storedGame("rooms", code, (room) => {
+        const current = room.players.find((p) => p.id === room.turn);
+        current.clock = {
+          elapsedMs: 250_000,
+          runningSince: Date.now() - 50_000 + 600,
+        };
+        room.players.find((p) => p !== current).clock = {
+          elapsedMs: 10_000,
+          runningSince: null,
+        };
+      });
+      await alice.request("/api/state");
+      await until(
+        () =>
+          [aWs, bWs].every((ws) =>
+            ws.messages.some((message) => message.room?.reason === "timeout"),
+          ),
+        "Room timeout was not pushed to both players",
+      );
+      const expired = (await alice.request("/api/state")).data.room;
+      assert.equal(expired.phase, "finished");
+      assert.equal(expired.winner, loser === "alice" ? "opponent" : "you");
+      assert.equal(expired.turn, null);
+      assert.equal(expired.opponent.secret, "1122");
+      assert.equal(expired.you.clock.runningSince, null);
+      assert.equal(expired.opponent.clock.runningSince, null);
+      const loserClock =
+        loser === "alice" ? expired.you.clock : expired.opponent.clock;
+      assert.equal(loserClock.elapsedMs, TIME_LIMIT_MS);
+      const late = await (loser === "alice" ? alice : bob).request(
+        "/api/rooms/guess",
+        { guess: loser === "alice" ? "1122" : "0012" },
+      );
+      assert.equal(late.status, 409);
+      assert.match(late.data.error, /超时/);
+      await alice.request("/api/rooms/rematch", {});
+      const rematch = (await bob.request("/api/rooms/rematch", {})).data.room;
+      assert.equal(rematch.phase, "setup");
+      assert.equal(rematch.match, 2);
+      assert.deepEqual(rematch.you.clock, makeClock());
+      assert.deepEqual(rematch.opponent.clock, makeClock());
+      await alice.request("/api/rooms/secret", { secret: "0012" });
+      const next = (await bob.request("/api/rooms/secret", { secret: "1122" }))
+        .data.room;
+      assert.equal(next.turn, "you");
+      assert.equal(typeof next.you.clock.runningSince, "number");
+      assert.deepEqual(next.opponent.clock, makeClock());
+    } finally {
+      aWs.terminate();
+      bWs.terminate();
+    }
+  }
+});
+
+test("服务重启保留预算，离线期间到期的单机和房间也会自动结算", async () => {
+  const { alice, code } = await duel();
+  await alice.request("/api/solo/start", {});
+  const secret = soloSecret(alice);
+  await alice.request("/api/solo/guess", {
+    guess: secret === "0000" ? "1111" : "0000",
+  });
+  await stop();
+  const deadline = Date.now() + 600;
+  storedGame("sessions", sessionId(alice), (session) => {
+    session.solo.clock = {
+      elapsedMs: 10_000,
+      runningSince: deadline - TIME_LIMIT_MS + 10_000,
+    };
+  });
+  storedGame("rooms", code, (room) => {
+    room.players.find((p) => p.id === room.turn).clock = {
+      elapsedMs: 30_000,
+      runningSince: deadline - TIME_LIMIT_MS + 30_000,
+    };
+  });
+  await start();
+  // Read SQLite directly: no page, request or socket is needed to finish games.
+  await until(
+    () =>
+      storedGame("sessions", sessionId(alice)).solo.reason === "timeout" &&
+      storedGame("rooms", code).reason === "timeout",
+    "Restart did not restore idle timeout jobs",
+  );
+  const restored = (await alice.request("/api/state")).data;
+  assert.equal(restored.solo.status, "lost");
+  assert.equal(restored.solo.answer, secret);
+  assert.equal(restored.room.phase, "finished");
+  assert.equal(restored.room.winner, "opponent");
 });

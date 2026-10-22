@@ -7,6 +7,16 @@
   const dialColors = { blue: "蓝色", yellow: "黄色" };
   const maxGuesses = 16;
   const reconnectMessage = "联机连接暂时断开，正在重连";
+  const shortToastMessages = new Map([
+    ["现在是对手的回合，请稍候", "现在是对手的回合"],
+    ["房间已过期，请重新创建或加入", "房间已过期"],
+    [
+      "已用完 5 分钟，本局超时失败，请开始新的一局",
+      "已用完 5 分钟，本局超时失败",
+    ],
+    ["本局已超时结束，可以再来一局", "本局已超时结束"],
+    ["秘密数字已锁定，等待双方准备完成", "秘密数字已锁定"],
+  ]);
   const invite = new URLSearchParams(location.search).get("room");
   const storage = {
     get(key) {
@@ -60,6 +70,11 @@
   let lastLongPress;
   let lastDialTap;
   let suppressedDialClick;
+  let timeLimitMs = 5 * 60_000;
+  let syncedServerTime = Date.now();
+  let syncedPerformance = performance.now();
+  let expirySyncPending = false;
+  let nextExpirySync = 0;
   const touchInput = navigator.maxTouchPoints > 0;
   const mobileDevice =
     Boolean(navigator.userAgentData?.mobile) ||
@@ -170,6 +185,8 @@
       settingsError.hidden = false;
       return;
     }
+    message = message.replace(/[。.]+$/u, "");
+    message = shortToastMessages.get(message) ?? message;
     clearTimeout(toastTimer);
     $("#toast").textContent = message;
     $("#toast").hidden = false;
@@ -236,18 +253,118 @@
     return `<div class="number-dial" role="group" aria-label="数字标记表盘">${Array.from({ length: 10 }, (_, n) => `<button type="button" class="dial-number" data-action="exclude-digit" data-digit="${n}" aria-label="标记数字${n}为排除" title="单击排除，双击打勾，长按或右键选色" aria-haspopup="true" aria-expanded="false"><span>${n}</span><span class="dial-check" aria-hidden="true" hidden>${icon("check")}</span></button>`).join("")}</div>`;
   }
 
-  function inputHeading(count = 0) {
-    return `<header class="input-heading"><h1>数字炸弹</h1><span class="attempt-count" aria-label="已猜 ${count} 次，共 ${maxGuesses} 次机会"><b>${String(Math.min(count, maxGuesses)).padStart(2, "0")}</b><span> / ${maxGuesses}</span></span></header>`;
+  const serverNow = () =>
+    syncedServerTime + Math.max(0, performance.now() - syncedPerformance);
+  const remainingTime = (clock) =>
+    Math.max(
+      0,
+      timeLimitMs -
+        (clock?.elapsedMs || 0) -
+        (clock?.runningSince != null
+          ? Math.max(0, serverNow() - clock.runningSince)
+          : 0),
+    );
+  function formatTime(ms, roundUp = true) {
+    const seconds = Math.max(0, (roundUp ? Math.ceil : Math.floor)(ms / 1000));
+    return `${String(Math.floor(seconds / 60)).padStart(2, "0")}:${String(seconds % 60).padStart(2, "0")}`;
+  }
+  function gameClocks(mode) {
+    const clocks =
+      mode === "solo"
+        ? [["solo", "剩余"]]
+        : [
+            ["you", "我"],
+            ["opponent", "对手"],
+          ];
+    return `<div class="game-clocks" aria-label="${mode === "solo" ? "单机计时" : "双方各有 5 分钟，仅本方回合计时"}">${clocks.map(([key, label]) => `<span class="game-clock" data-clock="${key}" role="timer" aria-label="${key === "solo" ? "单机" : key === "you" ? "我的" : "对手"}剩余时间" aria-live="off"><span class="clock-dot" aria-hidden="true"></span><span class="clock-label">${label}</span><b data-time>05:00</b></span>`).join("")}</div>`;
+  }
+  function updateClocks() {
+    let needsExpirySync = false;
+    for (const element of panel.querySelectorAll("[data-clock]")) {
+      const key = element.dataset.clock;
+      const clock =
+        key === "solo" ? state.solo?.clock : state.room?.[key]?.clock;
+      const remaining = remainingTime(clock);
+      const running = clock?.runningSince != null;
+      const waiting =
+        key === "solo" &&
+        state.solo?.status === "playing" &&
+        !running &&
+        !clock?.elapsedMs;
+      const value = formatTime(remaining);
+      if ($("[data-time]", element).textContent !== value)
+        $("[data-time]", element).textContent = value;
+      if (key === "solo")
+        $(".clock-label", element).textContent = waiting
+          ? "首猜起计时"
+          : "剩余";
+      element.dataset.running = String(running);
+      element.dataset.low = String(remaining <= 60_000);
+      element.title = waiting
+        ? "第一次点击猜一下后开始计时，共 5 分钟"
+        : running
+          ? "正在计时，刷新或离线仍继续"
+          : "计时已暂停";
+      if (running && remaining <= 0) needsExpirySync = true;
+    }
+    if (
+      needsExpirySync &&
+      !expirySyncPending &&
+      !ui.loading &&
+      !ui.error &&
+      document.visibilityState === "visible" &&
+      performance.now() >= nextExpirySync
+    ) {
+      expirySyncPending = true;
+      refreshState()
+        .catch(() => {})
+        .finally(() => {
+          expirySyncPending = false;
+          nextExpirySync = performance.now() + 1000;
+        });
+    }
+  }
+  function inputHeading(count = 0, mode = null) {
+    return `<header class="input-heading"><h1>数字炸弹</h1><div class="round-meta">${mode ? gameClocks(mode) : ""}<span class="attempt-count" aria-label="已猜 ${count} 次，共 ${maxGuesses} 次机会"><b>${String(Math.min(count, maxGuesses)).padStart(2, "0")}</b><span> / ${maxGuesses}</span></span></div></header>`;
   }
 
-  function result(code, action, label, disabled = false) {
-    return `<div class="round-result"><div class="result-code" aria-label="答案 ${esc(code || "未设置")}">${Array.from({ length: 4 }, (_, i) => `<span class="result-digit">${esc(code?.[i] || "−")}</span>`).join("")}</div><button class="result-action" data-action="${action}"${disable(disabled || ui.busy)}>${label}</button></div>`;
+  function outcomeBanner(title, kind) {
+    const symbol = {
+      success: "check",
+      failure: "close",
+      timeout: "clock",
+      revealed: "eye",
+      draw: "refresh",
+    }[kind];
+    return `<div class="outcome-banner" data-kind="${kind}" role="status"><span class="outcome-symbol" aria-hidden="true">${icon(symbol)}</span><div class="outcome-copy"><h2>${title}</h2></div></div>`;
+  }
+
+  function soloOutcome(solo) {
+    if (solo.status === "won") return outcomeBanner("挑战成功！", "success");
+    if (solo.reason === "timeout") return outcomeBanner("时间超时", "timeout");
+    if (solo.status === "lost") return outcomeBanner("次数用尽", "failure");
+    return outcomeBanner("答案揭晓", "revealed");
+  }
+
+  function roomOutcome(room) {
+    if (room.reason === "timeout")
+      return room.winner === "you"
+        ? outcomeBanner("对手超时！", "success")
+        : outcomeBanner("时间超时", "timeout");
+    if (room.winner === "you") return outcomeBanner("挑战成功！", "success");
+    if (room.winner) return outcomeBanner("挑战失败", "failure");
+    if (room.reason === "limit") return outcomeBanner("本局流局", "draw");
+    return outcomeBanner("对局结束", "revealed");
+  }
+
+  function result(code, action, label, outcome, disabled = false) {
+    return `<div class="round-result"><div class="result-summary">${outcome}<div class="result-code" aria-label="答案 ${esc(code || "未设置")}">${Array.from({ length: 4 }, (_, i) => `<span class="result-digit">${esc(code?.[i] || "−")}</span>`).join("")}</div></div><button class="result-action" data-action="${action}"${disable(disabled || ui.busy)}>${label}</button></div>`;
   }
 
   function soloPanel() {
     const solo = state.solo;
     const ended = solo && solo.status !== "playing";
-    return `<section class="input-panel" aria-label="单机输入">${inputHeading(solo?.guesses.length || 0)}${ended ? `<div class="context-bar" role="status">${solo.status === "won" ? "猜中了" : solo.status === "lost" ? "挑战失败" : "答案"}</div>${result(solo.answer, "new-solo", "再来一局")}` : numberForm("soloGuess", "solo-guess", "输入四位猜测数字", "猜一下", !solo)}</section>${historyPanel(solo?.guesses || [])}`;
+    return `<section class="input-panel" aria-label="单机输入">${inputHeading(solo?.guesses.length || 0, "solo")}${ended ? result(solo.answer, "new-solo", "再来一局", soloOutcome(solo)) : numberForm("soloGuess", "solo-guess", "输入四位猜测数字", "猜一下", !solo)}</section>${historyPanel(solo?.guesses || [])}`;
   }
 
   function lobbyPanel() {
@@ -263,14 +380,7 @@
     let controls;
     let status;
     if (ended) {
-      status =
-        room.winner === "you"
-          ? "你赢了"
-          : room.winner
-            ? "对手获胜"
-            : room.reason === "limit"
-              ? "流局"
-              : "已结束";
+      status = "本局结束";
       controls = result(
         opponent?.secret,
         room.phase === "finished" ? "rematch" : "leave-room",
@@ -281,6 +391,7 @@
             : opponent?.rematch
               ? "接受再战"
               : "再来一局",
+        roomOutcome(room),
         me.rematch,
       );
     } else if (!me.ready) {
@@ -308,7 +419,7 @@
         !yourTurn,
       );
     }
-    return `<section class="input-panel" aria-label="联机输入">${inputHeading(me.guesses.length)}<div class="context-bar"><span role="status">${status}</span><div class="context-actions">${["waiting", "setup"].includes(room.phase) ? `<button class="room-code-button" data-action="copy-invite" aria-label="复制邀请"><span class="room-code-value">${room.code}</span>${icon("copy")}</button>` : me.secret ? `<button class="secret-peek" data-action="toggle-secret" aria-label="${ui.reveal ? "隐藏" : "查看"}我的秘密数字" aria-pressed="${ui.reveal}">${ui.reveal ? me.secret : "••••"}</button>` : ""}<button class="icon-button" data-action="leave-room" aria-label="退出房间" title="退出房间"${disable(ui.busy)}>${icon("close")}</button></div></div>${controls}</section>${historyPanel(ui.history === "you" ? me.guesses : opponent?.guesses || [], true)}`;
+    return `<section class="input-panel" aria-label="联机输入">${inputHeading(me.guesses.length, "duel")}<div class="context-bar"><span role="status">${status}</span><div class="context-actions">${["waiting", "setup"].includes(room.phase) ? `<button class="room-code-button" data-action="copy-invite" aria-label="复制邀请"><span class="room-code-value">${room.code}</span>${icon("copy")}</button>` : me.secret ? `<button class="secret-peek" data-action="toggle-secret" aria-label="${ui.reveal ? "隐藏" : "查看"}我的秘密数字" aria-pressed="${ui.reveal}">${ui.reveal ? me.secret : "••••"}</button>` : ""}<button class="icon-button" data-action="leave-room" aria-label="退出房间" title="退出房间"${disable(ui.busy)}>${icon("close")}</button></div></div>${controls}</section>${historyPanel(ui.history === "you" ? me.guesses : opponent?.guesses || [], true)}`;
   }
 
   function render() {
@@ -341,10 +452,17 @@
     updateDial();
     positionDialPalette();
     updateSettingsActions();
+    updateClocks();
   }
 
   function applyState(next) {
     if (next.version < state.version) return;
+    if (Number.isFinite(next.serverNow)) {
+      syncedServerTime = next.serverNow;
+      syncedPerformance = performance.now();
+    }
+    if (Number.isFinite(next.timeLimitMs) && next.timeLimitMs > 0)
+      timeLimitMs = next.timeLimitMs;
     const previous = state;
     const changed =
       JSON.stringify({ solo: previous.solo, room: previous.room }) !==
@@ -366,11 +484,20 @@
       next.room.turn === "you"
     )
       announce("你的回合。");
+    if (next.solo?.reason === "timeout" && previous.solo?.reason !== "timeout")
+      announce("时间超时，单机挑战失败。");
+    if (next.room?.reason === "timeout" && previous.room?.reason !== "timeout")
+      announce(
+        next.room.winner === "you"
+          ? "对手超时，你获胜了。"
+          : "时间超时，本局挑战失败。",
+      );
     if (changed || ui.loading || ui.error) {
       ui.loading = false;
       ui.error = false;
       render();
     }
+    updateClocks();
     connect();
   }
 
@@ -589,7 +716,7 @@
   }
   function openRules() {
     openModal(
-      `<div class="modal-heading"><h2 id="modal-title">玩法说明</h2><button class="icon-button" aria-label="关闭说明" data-action="close-modal">${icon("close")}</button></div><div class="rules-content"><p>猜一个四位数，首位可以是 0，数字可以重复。单机有 16 次机会，用完仍未猜中则挑战失败。</p><ul><li><strong>数字对：</strong>匹配的数字总数，包含位置正确的数字；重复数字按次数匹配。</li><li><strong>位置对：</strong>数字和位置都正确的个数。四个位置全对即获胜。</li></ul><p>例如答案 <b>0012</b>，猜 <b>0001</b>：数字对 <b>3</b> 个，位置对 <b>2</b> 个。</p><ul><li>联机时双方先设置自己的数字，再轮流猜对方；房主先手，先猜中者获胜，再战交换先手。每人有 16 次机会，双方均未猜中则流局。</li></ul></div><div class="modal-actions"><button class="button" data-action="settings">返回设置</button><button class="button button-primary" data-action="close-modal">知道了</button></div>`,
+      `<div class="modal-heading"><h2 id="modal-title">玩法说明</h2><button class="icon-button" aria-label="关闭说明" data-action="close-modal">${icon("close")}</button></div><div class="rules-content"><p>猜一个四位数，首位可以是 0，数字可以重复。单机有 16 次机会，用完仍未猜中则挑战失败。</p><ul><li><strong>数字对：</strong>匹配的数字总数，包含位置正确的数字；重复数字按次数匹配。</li><li><strong>位置对：</strong>数字和位置都正确的个数。四个位置全对即获胜。</li></ul><p>例如答案 <b>0012</b>，猜 <b>0001</b>：数字对 <b>3</b> 个，位置对 <b>2</b> 个。</p><ul><li><strong>单机计时：</strong>第一次点击“猜一下”后开始，共 5 分钟；时间用尽即挑战失败并显示答案。</li><li><strong>联机计时：</strong>双方准备好后，先手开始计时。每人累计 5 分钟，只在自己的回合计时，等待对手时暂停；用时耗尽的一方判负。</li><li>刷新、切换模式、切到后台或断线都会继续计算正在进行的计时。剩余不足 1 分钟时倒计时会变色。</li><li>联机时双方先设置自己的数字，再轮流猜对方；房主先手，先猜中者获胜，再战交换先手。每人有 16 次机会，双方均未猜中则流局。新局重置计时。</li><li>重复猜测仅提示已猜过，不消耗机会，也不会暂停计时。</li></ul></div><div class="modal-actions"><button class="button" data-action="settings">返回设置</button><button class="button button-primary" data-action="close-modal">知道了</button></div>`,
       "rules",
     );
   }
@@ -993,6 +1120,12 @@
     } else if (key === "secret") {
       act("/api/rooms/secret", { secret: value }, { clear: key });
     } else {
+      const guesses =
+        key === "soloGuess" ? state.solo?.guesses : state.room?.you.guesses;
+      if (guesses?.some((g) => g.guess === value)) {
+        toast("这个数字已经猜过了");
+        return;
+      }
       act(
         key === "soloGuess" ? "/api/solo/guess" : "/api/rooms/guess",
         { guess: value },
@@ -1212,5 +1345,6 @@
       .catch(() => {})
       .finally(connect);
   });
+  setInterval(updateClocks, 250);
   initialize();
 })();

@@ -12,6 +12,11 @@ import {
   publicSolo,
   publicRoom,
   MAX_GUESSES,
+  TIME_LIMIT_MS,
+  makeClock,
+  stopClock,
+  syncSoloClock,
+  syncRoomClocks,
 } from "./lib/game.mjs";
 
 const root = dirname(fileURLToPath(import.meta.url));
@@ -42,46 +47,92 @@ const q = {
   ),
   expireSessions: db.prepare("DELETE FROM sessions WHERE updated_at < ?"),
   expireRooms: db.prepare("DELETE FROM rooms WHERE updated_at < ?"),
+  activeSessions: db.prepare(
+    "SELECT id FROM sessions WHERE json_extract(data, '$.solo.status') = 'playing'",
+  ),
+  activeRooms: db.prepare(
+    "SELECT code FROM rooms WHERE json_extract(data, '$.phase') = 'playing'",
+  ),
 };
 
 const clients = new Map();
 const rateLimits = new Map();
+const soloTimers = new Map();
+const roomTimers = new Map();
 const DAY = 86_400_000;
 let version = Date.now() * 1000;
 const getSession = (id) => {
   const row = q.session.get(id);
   if (!row) return null;
   const session = JSON.parse(row.data);
-  if (
-    session.solo?.status === "playing" &&
-    session.solo.guesses.length >= MAX_GUESSES
-  ) {
-    session.solo.status = "lost";
-    q.saveSession.run(id, JSON.stringify(session), Date.now());
-  }
+  const wasPlaying = session.solo?.status === "playing";
+  if (syncSoloClock(session.solo)) saveSession(session);
+  else scheduleSolo(session);
+  if (wasPlaying && session.solo.status !== "playing")
+    queueMicrotask(() => pushSession(id));
   return session;
 };
 const getRoom = (code) => {
   const row = code && q.room.get(code);
   if (!row) return null;
   const room = JSON.parse(row.data);
-  // Existing rooms from before the attempt limit also finish consistently.
-  if (
-    room.phase === "playing" &&
-    room.players.every((p) => p.guesses.length >= MAX_GUESSES)
-  ) {
-    room.phase = "finished";
-    room.reason = "limit";
-    room.winner = null;
-    room.turn = null;
-    q.saveRoom.run(code, JSON.stringify(room), Date.now());
-  }
+  const wasPlaying = room.phase === "playing";
+  if (syncRoomClocks(room)) saveRoom(room);
+  else scheduleRoom(room);
+  if (wasPlaying && room.phase === "finished")
+    queueMicrotask(() => pushRoom(room));
   return room;
 };
-const saveSession = (s) =>
+const saveSession = (s) => {
   q.saveSession.run(s.id, JSON.stringify(s), Date.now());
-const saveRoom = (r) => q.saveRoom.run(r.code, JSON.stringify(r), Date.now());
+  scheduleSolo(s);
+};
+const saveRoom = (r) => {
+  q.saveRoom.run(r.code, JSON.stringify(r), Date.now());
+  scheduleRoom(r);
+};
 const online = (id) => Boolean(clients.get(id)?.size);
+
+function scheduleTimeout(timers, key, clock, recover) {
+  const deadline =
+    clock && clock.runningSince !== null
+      ? clock.runningSince + TIME_LIMIT_MS - clock.elapsedMs
+      : null;
+  const existing = timers.get(key);
+  if (existing?.deadline === deadline) return;
+  clearTimeout(existing?.timer);
+  timers.delete(key);
+  if (deadline === null) return;
+  const timer = setTimeout(
+    () => {
+      timers.delete(key);
+      // Recovery settles and broadcasts expired games, or rearms an early timer.
+      recover(key);
+    },
+    Math.max(1, deadline - Date.now()),
+  ).unref();
+  timers.set(key, { deadline, timer });
+}
+
+function scheduleSolo(session) {
+  scheduleTimeout(
+    soloTimers,
+    session.id,
+    session.solo?.status === "playing" ? session.solo.clock : null,
+    getSession,
+  );
+}
+
+function scheduleRoom(room) {
+  scheduleTimeout(
+    roomTimers,
+    room.code,
+    room.phase === "playing"
+      ? room.players.find((p) => p.id === room.turn)?.clock
+      : null,
+    getRoom,
+  );
+}
 
 function identity(req) {
   const token = req.headers.cookie
@@ -113,6 +164,8 @@ function sessionFor(req, res) {
 function stateFor(session) {
   return {
     version: ++version,
+    serverNow: Date.now(),
+    timeLimitMs: TIME_LIMIT_MS,
     solo: publicSolo(session.solo),
     room: publicRoom(getRoom(session.room), session.id, online),
   };
@@ -168,6 +221,12 @@ function checkRate(key, limit, window = 60_000) {
 // commits them before either the HTTP reply or the per-player WebSocket update.
 function action(path, session, body) {
   let room;
+  const now = Date.now();
+  // A deadline can pass between reading the session and entering this action.
+  if (syncSoloClock(session.solo, now)) {
+    saveSession(session);
+    queueMicrotask(() => pushSession(session.id));
+  }
   switch (path) {
     case "/api/solo/start":
       session.solo = makeSolo();
@@ -176,21 +235,35 @@ function action(path, session, body) {
       requireCode(body.guess);
       const solo = session.solo;
       if (!solo || solo.status !== "playing")
-        throw new GameError("请先开始新的一局。", 409);
+        throw new GameError(
+          solo?.reason === "timeout"
+            ? "已用完 5 分钟，本局超时失败，请开始新的一局。"
+            : "请先开始新的一局。",
+          409,
+        );
       if (solo.guesses.length >= MAX_GUESSES)
         throw new GameError("已用完 16 次机会，请开始新的一局。", 409);
       if (solo.guesses.some((g) => g.guess === body.guess))
         throw new GameError("这个数字已经猜过了");
+      if (solo.clock.runningSince === null) solo.clock.runningSince = now;
       const result = scoreGuess(solo.secret, body.guess);
       solo.guesses.push({ guess: body.guess, ...result });
-      if (result.positions === 4) solo.status = "won";
-      else if (solo.guesses.length >= MAX_GUESSES) solo.status = "lost";
+      if (result.positions === 4) {
+        solo.status = "won";
+        solo.reason = "guessed";
+      } else if (solo.guesses.length >= MAX_GUESSES) {
+        solo.status = "lost";
+        solo.reason = "limit";
+      }
+      if (solo.status !== "playing") stopClock(solo.clock, now);
       break;
     }
     case "/api/solo/reveal":
       if (!session.solo || session.solo.status !== "playing")
         throw new GameError("当前没有进行中的单机游戏。", 409);
       session.solo.status = "revealed";
+      session.solo.reason = "revealed";
+      stopClock(session.solo.clock, now);
       break;
     case "/api/rooms/create": {
       if (publicRoom(getRoom(session.room), session.id))
@@ -213,6 +286,7 @@ function action(path, session, body) {
             secret: null,
             guesses: [],
             rematch: false,
+            clock: makeClock(),
           },
         ],
         first: session.id,
@@ -242,6 +316,7 @@ function action(path, session, body) {
         secret: null,
         guesses: [],
         rematch: false,
+        clock: makeClock(),
       });
       room.phase = "setup";
       session.room = room.code;
@@ -262,6 +337,7 @@ function action(path, session, body) {
       ) {
         room.phase = "playing";
         room.turn = room.first;
+        room.players.find((p) => p.id === room.turn).clock.runningSince = now;
       }
       break;
     }
@@ -269,7 +345,12 @@ function action(path, session, body) {
       requireCode(body.guess);
       room = activeRoom(session);
       if (room.phase !== "playing")
-        throw new GameError("请等待双方都设置好秘密数字。", 409);
+        throw new GameError(
+          room.reason === "timeout"
+            ? "本局已超时结束，可以再来一局。"
+            : "请等待双方都设置好秘密数字。",
+          409,
+        );
       if (room.turn !== session.id)
         throw new GameError("现在是对手的回合，请稍候。", 409);
       const me = room.players.find((p) => p.id === session.id);
@@ -278,12 +359,14 @@ function action(path, session, body) {
         throw new GameError("你已用完 16 次机会，请等待对手完成。", 409);
       if (me.guesses.some((g) => g.guess === body.guess))
         throw new GameError("这个数字已经猜过了");
+      stopClock(me.clock, now);
       const result = scoreGuess(opponent.secret, body.guess);
       me.guesses.push({ guess: body.guess, ...result });
       if (result.positions === 4) {
         room.phase = "finished";
         room.winner = session.id;
         room.reason = "guessed";
+        room.turn = null;
       } else if (room.players.every((p) => p.guesses.length >= MAX_GUESSES)) {
         room.phase = "finished";
         room.winner = null;
@@ -291,6 +374,7 @@ function action(path, session, body) {
         room.turn = null;
       } else {
         room.turn = opponent.id;
+        opponent.clock.runningSince = now;
       }
       break;
     }
@@ -310,6 +394,7 @@ function action(path, session, body) {
           p.secret = null;
           p.guesses = [];
           p.rematch = false;
+          p.clock = makeClock();
         }
       }
       break;
@@ -326,6 +411,8 @@ function action(path, session, body) {
               : null;
         }
         room.phase = "closed";
+        room.turn = null;
+        for (const player of room.players) stopClock(player.clock, now);
       }
       session.room = null;
       break;
@@ -338,7 +425,7 @@ function action(path, session, body) {
     saveRoom(room);
     pushRoom(room);
   } else pushSession(session.id);
-  return stateFor(session);
+  return stateFor(getSession(session.id));
 }
 
 const assets = new Map(
@@ -538,6 +625,9 @@ const cleanup = () => {
     if (value.until < Date.now()) rateLimits.delete(key);
 };
 cleanup();
+// Restore deadlines even if neither player returns after a server restart.
+for (const { id } of q.activeSessions.all()) getSession(id);
+for (const { code } of q.activeRooms.all()) getRoom(code);
 const maintenance = setInterval(cleanup, 15 * 60_000);
 
 const port = Number(process.env.PORT || 4186);
@@ -549,6 +639,10 @@ server.listen(port, "127.0.0.1", () =>
 function shutdown() {
   clearInterval(heartbeat);
   clearInterval(maintenance);
+  for (const timers of [soloTimers, roomTimers]) {
+    for (const { timer } of timers.values()) clearTimeout(timer);
+    timers.clear();
+  }
   for (const ws of wss.clients) ws.close(1012, "Server restarting");
   server.close(() => {
     db.close();
